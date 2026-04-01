@@ -1,0 +1,107 @@
+name: Auto Build Flutter APK from Upstream Release
+
+on:
+    schedule:
+        - cron: "*/30 * * * *" # 每30分钟检测一次
+    workflow_dispatch:
+
+jobs:
+    check-and-build:
+        runs-on: ubuntu-latest
+
+        steps:
+            # 1. Checkout 当前仓库（用于存状态）
+            - name: Checkout
+              uses: actions/checkout@v5
+
+            # 2. 获取最新 release tag
+            - name: Get latest release
+              id: latest_release
+              run: |
+                  TAG=$(curl -s https://api.github.com/repos/15dd/hikari_novel_flutter/releases/latest | jq -r .tag_name)
+                  echo "latest_tag=$TAG" >> $GITHUB_OUTPUT
+
+            # 3. 读取上一次构建的 tag
+            - name: Read last built tag
+              id: last_tag
+              run: |
+                  if [ -f last_tag.txt ]; then
+                    TAG=$(cat last_tag.txt)
+                  else
+                    TAG=""
+                  fi
+                  echo "last_tag=$TAG" >> $GITHUB_OUTPUT
+
+            # 4. 判断是否需要构建
+            - name: Check if new release
+              id: should_build
+              run: |
+                  if [ "${{ steps.latest_release.outputs.latest_tag }}" != "${{ steps.last_tag.outputs.last_tag }}" ]; then
+                    echo "build=true" >> $GITHUB_OUTPUT
+                  else
+                    echo "build=false" >> $GITHUB_OUTPUT
+                  fi
+
+            # ❗ 如果不是新版本，直接退出
+            - name: Stop if no new release
+              if: steps.should_build.outputs.build == 'false'
+              run: |
+                  echo "No new release. Skip build."
+                  exit 0
+
+            # 5. 拉取目标仓库代码（指定 tag）
+            - name: Checkout upstream repo
+              uses: actions/checkout@v5
+              with:
+                  repository: 15dd/hikari_novel_flutter
+                  ref: ${{ steps.latest_release.outputs.latest_tag }}
+                  path: app
+
+            # 6. Java
+            - name: Set up JDK
+              uses: actions/setup-java@v4
+              with:
+                  distribution: "temurin"
+                  java-version: "17"
+
+            # 7. Flutter（指定版本，避免 SDK 不兼容）
+            - name: Setup Flutter
+              uses: subosito/flutter-action@v2
+              with:
+                  channel: "stable"
+                  cache: true
+
+            # 8. Build
+            - name: Install dependencies
+              working-directory: app
+              run: flutter pub get
+
+            - name: Build APK
+              working-directory: app
+              run: flutter build apk --release
+
+            # 9. 上传 APK
+            - name: Upload APK
+              uses: actions/upload-artifact@v6
+              with:
+                  name: hikari-apk-${{ steps.latest_release.outputs.latest_tag }}
+                  path: app/build/app/outputs/flutter-apk/app-release.apk
+
+            # 10. 保存当前 tag（防重复）
+            - name: Save latest tag
+              run: |
+                  echo "${{ steps.latest_release.outputs.latest_tag }}" > last_tag.txt
+
+            - name: Commit tag state
+              run: |
+                  git config user.name "github-actions"
+                  git config user.email "actions@github.com"
+                  git add last_tag.txt
+                  git commit -m "update last built tag"
+                  git push
+
+            - name: Create Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ steps.latest_release.outputs.latest_tag }}
+                  files: app/build/app/outputs/flutter-apk/app-release.apk
