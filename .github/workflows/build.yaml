@@ -9,82 +9,95 @@ permissions:
   contents: write
 
 jobs:
-  check-and-build:
+  # ✅ Job1：检查是否需要构建
+  check:
     runs-on: ubuntu-latest
+    outputs:
+      latest_tag: ${{ steps.latest.outputs.latest_tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
 
     steps:
-      # 1. 获取 upstream 最新 release
-      - name: Get latest release
-        id: latest_release
+      - name: Get latest upstream release
+        id: latest
         run: |
           TAG=$(curl -s https://api.github.com/repos/15dd/hikari_novel_flutter/releases/latest | jq -r '.tag_name')
           echo "latest_tag=$TAG" >> $GITHUB_OUTPUT
 
-      # 2. 判断是否已经发布过
-      - name: Check if release exists
-        id: check_release
+      - name: Check if already released
+        id: check
         run: |
-          TAG=${{ steps.latest_release.outputs.latest_tag }}
+          TAG=${{ steps.latest.outputs.latest_tag }}
 
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG)
 
           if [ "$STATUS" = "200" ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "Release exists, skip build."
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "New release found, start build."
           fi
 
-      - name: Stop if already built
-        if: steps.check_release.outputs.exists == 'true'
-        run: |
-          echo "Release already exists. Skip."
-          exit 0
+  # ✅ Job2：构建 APK
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
 
-      # 3. 拉 upstream
+    steps:
+      # 1. 拉 upstream
       - name: Checkout upstream repo
         uses: actions/checkout@v5
         with:
           repository: 15dd/hikari_novel_flutter
-          ref: ${{ steps.latest_release.outputs.latest_tag }}
+          ref: ${{ needs.check.outputs.latest_tag }}
           path: app
 
-      # 4. Java
+      # 2. Java
       - name: Set up JDK
         uses: actions/setup-java@v5
         with:
           distribution: "temurin"
           java-version: "17"
 
-      # 5. Flutter（建议锁版本）
+      # 3. Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           cache: true
 
-      # 6. 依赖
+      # 4. 依赖
       - name: Install dependencies
         working-directory: app
         run: flutter pub get
 
-      # 7. 构建
-      - name: Build APK
+      # 🔥 5. 构建多架构 APK（重点）
+      - name: Build APK (split per ABI)
         working-directory: app
-        run: flutter build apk --release
+        run: |
+          flutter build apk --release --split-per-abi
 
-      # ✅ 8. 上传 Artifact（Actions 下载）
-      - name: Upload Artifact
+      # 🔥 6. 额外构建 universal APK（可选但推荐）
+      - name: Build Universal APK
+        working-directory: app
+        run: |
+          flutter build apk --release
+
+      # 7. 上传 Artifact
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: hikari-apk-${{ steps.latest_release.outputs.latest_tag }}
-          path: app/build/app/outputs/flutter-apk/app-release.apk
+          name: hikari-apk-${{ needs.check.outputs.latest_tag }}
+          path: |
+            app/build/app/outputs/flutter-apk/*.apk
 
-      # ✅ 9. 发布 Release
+      # 8. 发布 Release
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.latest_release.outputs.latest_tag }}
-          name: hikari ${{ steps.latest_release.outputs.latest_tag }}
-          files: app/build/app/outputs/flutter-apk/app-release.apk
+          tag_name: ${{ needs.check.outputs.latest_tag }}
+          name: hikari ${{ needs.check.outputs.latest_tag }}
+          files: app/build/app/outputs/flutter-apk/*.apk
