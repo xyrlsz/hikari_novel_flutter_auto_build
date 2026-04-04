@@ -40,7 +40,7 @@ jobs:
             echo "New release found, start build."
           fi
 
-  # ✅ Job2：构建 APK
+  # ✅ Job2：构建 APK 并签名
   build:
     needs: check
     if: needs.check.outputs.should_build == 'true'
@@ -55,38 +55,147 @@ jobs:
           ref: ${{ needs.check.outputs.latest_tag }}
           path: app
 
-      # 2. Java
+      # 2. Checkout current repo to access keystore
+      - name: Checkout current repository
+        uses: actions/checkout@v5
+        with:
+          path: current-repo
+
+      # 3. Copy keystore to app directory
+      - name: Copy keystore to app directory
+        run: |
+          cp current-repo/xcimoc.jks app/
+          ls -la app/xcimoc.jks
+
+      # 4. Configure key.properties in app directory
+      - name: Create key.properties
+        env:
+          KEYSTORE_PASSWORD: "123456"
+          KEY_ALIAS: "xc"
+          KEY_PASSWORD: "123456"
+        run: |
+          cd app
+          cat > android/key.properties << EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=xcimoc.jks
+          EOF
+          echo "key.properties created"
+
+      # 5. Java (with Android SDK tools)
       - name: Set up JDK
         uses: actions/setup-java@v5
         with:
           distribution: "temurin"
           java-version: "17"
 
-      # 3. Flutter
+      # 6. Install Android SDK tools for apksigner
+      - name: Install Android SDK tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y android-sdk-build-tools
+
+      # 7. Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           cache: true
 
-      # 4. 依赖
+      # 8. 依赖
       - name: Install dependencies
         working-directory: app
         run: flutter pub get
 
-      # 🔥 5. 构建多架构 APK（重点）
+      # 🔥 9. 构建多架构 APK（重点）
       - name: Build APK (split per ABI)
         working-directory: app
         run: |
           flutter build apk --release --split-per-abi
 
-      # 🔥 6. 额外构建 universal APK（可选但推荐）
+      # 🔥 10. 额外构建 universal APK（可选但推荐）
       - name: Build Universal APK
         working-directory: app
         run: |
           flutter build apk --release
 
-      # 7. 上传 Artifact
+      # 🔥 11. 手动签名APK（如果Flutter构建未正确签名）
+      - name: Manual APK Signing
+        working-directory: app
+        env:
+          KEYSTORE_PASSWORD: "123456"
+          KEY_ALIAS: "xc"
+          KEY_PASSWORD: "123456"
+        run: |
+          # Find all APK files
+          for apk in build/app/outputs/flutter-apk/*.apk; do
+            if [ -f "$apk" ]; then
+              echo "Signing $apk..."
+              
+              # Get the base name without extension
+              basename=$(basename "$apk" .apk)
+              output_apk="build/app/outputs/flutter-apk/${basename}-signed.apk"
+              
+              # Sign the APK using apksigner
+              if command -v apksigner &> /dev/null; then
+                echo "Using apksigner to sign $apk"
+                apksigner sign --ks xcimoc.jks --out "$output_apk" --ks-key-alias "$KEY_ALIAS" --ks-pass pass:"$KEYSTORE_PASSWORD" --key-pass pass:"$KEY_PASSWORD" "$apk"
+                
+                # Verify the signed APK
+                echo "Verifying signature for $output_apk..."
+                apksigner verify --verbose "$output_apk"
+                
+                # Replace original APK with signed version
+                mv "$output_apk" "$apk"
+              else
+                echo "apksigner not found, attempting to locate it in Android SDK"
+                ANDROID_HOME=/usr/local/lib/android/sdk
+                APKSIGNER_PATH="$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -n 1)/apksigner"
+                if [ -f "$APKSIGNER_PATH" ]; then
+                  echo "Using apksigner from $APKSIGNER_PATH to sign $apk"
+                  "$APKSIGNER_PATH" sign --ks xcimoc.jks --out "$output_apk" --ks-key-alias "$KEY_ALIAS" --ks-pass pass:"$KEYSTORE_PASSWORD" --key-pass pass:"$KEY_PASSWORD" "$apk"
+                  
+                  # Verify the signed APK
+                  echo "Verifying signature for $output_apk..."
+                  "$APKSIGNER_PATH" verify --verbose "$output_apk"
+                  
+                  # Replace original APK with signed version
+                  mv "$output_apk" "$apk"
+                else
+                  echo "apksigner not found in expected locations"
+                  exit 1
+                fi
+              fi
+            fi
+          done
+
+      # 🔥 12. 验证签名
+      - name: Verify APK Signatures
+        working-directory: app
+        run: |
+          # List all APKs built
+          find build/app/outputs/flutter-apk -name "*.apk" -exec echo "Checking: {}" \;
+
+          # Check signature for each APK
+          for apk in build/app/outputs/flutter-apk/*.apk; do
+            if command -v apksigner &> /dev/null; then
+              echo "Verifying signature for $apk:"
+              apksigner verify --verbose "$apk"
+            else
+              ANDROID_HOME=/usr/local/lib/android/sdk
+              APKSIGNER_PATH="$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -n 1)/apksigner"
+              if [ -f "$APKSIGNER_PATH" ]; then
+                echo "Verifying signature for $apk using $APKSIGNER_PATH:"
+                "$APKSIGNER_PATH" verify --verbose "$apk"
+              else
+                echo "apksigner not found, cannot verify signatures"
+                exit 1
+              fi
+            fi
+          done
+
+      # 13. 上传 Artifact
       - name: Upload Artifacts
         uses: actions/upload-artifact@v6
         with:
@@ -94,7 +203,7 @@ jobs:
           path: |
             app/build/app/outputs/flutter-apk/*.apk
 
-      # 8. 发布 Release
+      # 14. 发布 Release
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
